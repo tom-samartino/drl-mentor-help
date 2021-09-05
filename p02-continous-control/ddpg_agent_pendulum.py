@@ -9,20 +9,40 @@ import torch
 import torch.nn.functional as F
 import torch.optim as optim
 
-BUFFER_SIZE = int(1e5)  # replay buffer size
-BATCH_SIZE = 128        # minibatch size
+BUFFER_SIZE = int(1e6)  # replay buffer size
+BATCH_SIZE = 100        # minibatch size
 GAMMA = 0.99            # discount factor
 TAU = 5e-3              # for soft update of target parameters
-LR_ACTOR = 1e-4         # learning rate of the actor 
+LR_ACTOR = 1e-3         # learning rate of the actor 
 LR_CRITIC = 1e-3        # learning rate of the critic
-WEIGHT_DECAY = 0.0001   # L2 weight decay
+WEIGHT_DECAY = 0        # L2 weight decay
+LEARN_EVERY = 1
+UPDATE_EVERY = 20
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+class LinearSchedule:
+    def __init__(self, start, end=None, steps=None):
+        if end is None:
+            end = start
+            steps = 1
+        self.inc = (end - start) / float(steps)
+        self.current = start
+        self.end = end
+        if end > start:
+            self.bound = min
+        else:
+            self.bound = max
+
+    def __call__(self, steps=1):
+        val = self.current
+        self.current = self.bound(self.current + self.inc * steps, self.end)
+        return val
 
 class Agent():
     """Interacts with and learns from the environment."""
     
-    def __init__(self, state_size, action_size, random_seed, steps_until_update):
+    def __init__(self, state_size, action_size, random_seed):
         """Initialize an Agent object.
         
         Params
@@ -34,7 +54,8 @@ class Agent():
         self.state_size = state_size
         self.action_size = action_size
         self.seed = np.random.seed(random_seed)
-        self.steps_until_update = steps_until_update
+        self.steps_until_update = UPDATE_EVERY
+        self.steps_until_learn = LEARN_EVERY
         self.step_counter = 0
 
         # Actor Network (w/ Target Network)
@@ -68,7 +89,10 @@ class Agent():
         state = torch.from_numpy(state).float().to(device)
         self.actor_local.eval()
         with torch.no_grad():
-            action = self.actor_local(state).cpu().data.numpy()
+            if device.type == 'cpu':
+                action = self.actor_local(state).cpu().data.numpy()
+            else:
+                action = self.actor_local(state).cuda().data.numpy()
         self.actor_local.train()
         if add_noise:
             action += self.noise.sample()
@@ -90,36 +114,36 @@ class Agent():
             gamma (float): discount factor
         """
         states, actions, rewards, next_states, dones = experiences
+        self.step_counter += 1
+        
+        if (self.step_counter % LEARN_EVERY == 0):
+            # ---------------------------- update critic ---------------------------- #
+            # Get predicted next-state actions and Q values from target models
+            actions_next = self.actor_target(next_states)
+            Q_targets_next = self.critic_target(next_states, actions_next)
+            # Compute Q targets for current states (y_i)
+            Q_targets = rewards + (gamma * Q_targets_next * (1 - dones))
+            # Compute critic loss
+            Q_expected = self.critic_local(states, actions)
+            critic_loss = F.mse_loss(Q_expected, Q_targets)
+            # Minimize the loss
+            self.critic_optimizer.zero_grad()
+            critic_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.critic_local.parameters(), 1)
+            self.critic_optimizer.step()
 
-        # ---------------------------- update critic ---------------------------- #
-        # Get predicted next-state actions and Q values from target models
-        actions_next = self.actor_target(next_states)
-        Q_targets_next = self.critic_target(next_states, actions_next)
-        # Compute Q targets for current states (y_i)
-        Q_targets = rewards + (gamma * Q_targets_next * (1 - dones))
-        # Compute critic loss
-        Q_expected = self.critic_local(states, actions)
-        critic_loss = F.mse_loss(Q_expected, Q_targets)
-        # Minimize the loss
-        self.critic_optimizer.zero_grad()
-        critic_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.critic_local.parameters(), 1)
-        self.critic_optimizer.step()
 
-
-        # ---------------------------- update actor ---------------------------- #
-        # Compute actor loss
-        actions_pred = self.actor_local(states)
-        actor_loss = -self.critic_local(states, actions_pred).mean()
-        # Minimize the loss
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        self.actor_optimizer.step()
+            # ---------------------------- update actor ---------------------------- #
+            # Compute actor loss
+            actions_pred = self.actor_local(states)
+            actor_loss = -self.critic_local(states, actions_pred).mean()
+            # Minimize the loss
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            self.actor_optimizer.step()
 
         # ----------------------- update target networks ----------------------- #
-        self.step_counter += 1
-        if (self.step_counter == self.steps_until_update):
-            self.step_counter = 0                      
+        if (self.step_counter % UPDATE_EVERY == 0):                   
             self.soft_update(self.critic_local, self.critic_target, TAU)
             self.soft_update(self.actor_local, self.actor_target, TAU)                     
 
